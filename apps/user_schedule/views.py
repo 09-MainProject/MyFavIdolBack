@@ -33,15 +33,17 @@ class UserScheduleListCreateView(generics.ListCreateAPIView):
     def get(self, request, *args, **kwargs):
         user = request.user
 
-        # 1. 사용자 일정
+        # 사용자 일정 조회
         user_schedules = self.get_queryset()
         user_schedule_data = self.get_serializer(user_schedules, many=True).data
 
-        # 2. 팔로우한 아이돌 스케줄
+        # 팔로우한 아이돌의 일정 조회
         followed_idol_ids = Follow.objects.filter(user=user).values_list(
             "idol_id", flat=True
         )
-        idol_schedules = Schedule.objects.filter(idol_id__in=followed_idol_ids)
+        idol_schedules = Schedule.objects.select_related("idol").filter(
+            idol_id__in=followed_idol_ids
+        )
         idol_schedule_data = IdolScheduleSerializer(idol_schedules, many=True).data
 
         return Response(
@@ -49,12 +51,8 @@ class UserScheduleListCreateView(generics.ListCreateAPIView):
                 "code": R.SCHEDULE_LIST_SUCCESS["code"],
                 "message": R.SCHEDULE_LIST_SUCCESS["message"],
                 "data": {
-                    "user_schedules": UserScheduleSerializer(
-                        user_schedules, many=True
-                    ).data,
-                    "idol_schedules": IdolScheduleSerializer(
-                        idol_schedules, many=True
-                    ).data,
+                    "user_schedules": user_schedule_data,
+                    "idol_schedules": idol_schedule_data,
                 },
             },
             status=R.SCHEDULE_LIST_SUCCESS["status"],
@@ -69,6 +67,7 @@ class UserScheduleListCreateView(generics.ListCreateAPIView):
         },
     )
     def post(self, request, *args, **kwargs):
+        # 사용자 일정 등록
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         serializer.save(user=request.user)
@@ -91,9 +90,10 @@ class UserScheduleDetailView(generics.RetrieveUpdateDestroyAPIView):
     authentication_classes = [JWTAuthentication]
 
     def get_object(self):
+        # 요청 사용자의 소유 일정만 조회 가능
         try:
             obj = super().get_object()
-        except Exception:
+        except UserSchedule.DoesNotExist:
             raise NotFound(R.SCHEDULE_NOT_FOUND["message"])
 
         if obj.user != self.request.user:

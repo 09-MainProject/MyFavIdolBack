@@ -1,8 +1,10 @@
+# views.py
+
 from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.db.models import Q
 from drf_yasg import openapi
 from drf_yasg.utils import swagger_auto_schema
-from rest_framework import generics, permissions
+from rest_framework import generics, permissions, status
 from rest_framework.response import Response
 
 from utils.responses import idol_schedule as S
@@ -11,96 +13,81 @@ from .models import Idol, Schedule
 from .serializers import ScheduleSerializer
 
 
-# 관리자 여부 확인용 커스텀 권한 클래스
 class IsManager(permissions.BasePermission):
     def has_permission(self, request, view):
         return request.user and request.user.is_authenticated and request.user.is_staff
 
 
-# 소유자 또는 관리자 여부 확인용 권한 클래스
 class IsIdolManagerOrOwner(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
-        if request.user.is_staff:
-            return True
-        return obj.user == request.user
+        return request.user.is_staff or obj.user == request.user
 
 
-# 일정 목록 조회 및 등록 (아이돌 단위)
 class ScheduleListCreateView(generics.ListCreateAPIView):
     serializer_class = ScheduleSerializer
 
     def get_permissions(self):
-        if self.request.method == "GET":
-            return [permissions.AllowAny()]
-        return [IsManager()]  # POST 요청은 매니저만 가능
+        return (
+            [permissions.AllowAny()] if self.request.method == "GET" else [IsManager()]
+        )
 
     def get_queryset(self):
         idol_id = self.kwargs["idol_id"]
-        queryset = Schedule.objects.filter(idol_id=idol_id)
-        filters = Q()
-        params = self.request.query_params
+        filters = Q(idol_id=idol_id)
 
-        # 필터 조건 동적 구성
-        if title := params.get("title"):
-            filters &= Q(title__icontains=title)
-        if description := params.get("description"):
-            filters &= Q(description__icontains=description)
-        if location := params.get("location"):
-            filters &= Q(location__icontains=location)
-        if start_date := params.get("start_date"):
-            filters &= Q(start_date__gte=start_date)
-        if end_date := params.get("end_date"):
-            filters &= Q(end_date__lte=end_date)
+        # query_map을 통해 QueryParam 기반 동적 필터링 수행
+        # 각 필드에 대해 해당 조건이 있을 경우 Q 객체에 추가
+        query_map = {
+            "title": "title__icontains",
+            "description": "description__icontains",
+            "location": "location__icontains",
+            "start_date": "start_date__gte",
+            "end_date": "end_date__lte",
+        }
 
-        return queryset.filter(filters)
+        for param, lookup in query_map.items():
+            if value := self.request.query_params.get(param):
+                filters &= Q(**{lookup: value})
+
+        return Schedule.objects.select_related("idol", "user").filter(filters)
 
     @swagger_auto_schema(
         operation_summary="아이돌 일정 목록 조회",
         tags=["아이돌 일정"],
         manual_parameters=[
             openapi.Parameter(
-                "title",
-                openapi.IN_QUERY,
-                description="제목 검색",
-                type=openapi.TYPE_STRING,
-            ),
-            openapi.Parameter(
-                "description",
-                openapi.IN_QUERY,
-                description="설명 검색",
-                type=openapi.TYPE_STRING,
-            ),
-            openapi.Parameter(
-                "location",
-                openapi.IN_QUERY,
-                description="장소 검색",
-                type=openapi.TYPE_STRING,
-            ),
+                p, openapi.IN_QUERY, description=f"{p} 검색", type=openapi.TYPE_STRING
+            )
+            for p in ["title", "description", "location"]
+        ]
+        + [
             openapi.Parameter(
                 "start_date",
                 openapi.IN_QUERY,
                 description="시작일 이후",
-                type=openapi.FORMAT_DATE,
+                type=openapi.TYPE_STRING,
+                format="date",
             ),
             openapi.Parameter(
                 "end_date",
                 openapi.IN_QUERY,
                 description="종료일 이전",
-                type=openapi.FORMAT_DATE,
+                type=openapi.TYPE_STRING,
+                format="date",
             ),
         ],
         responses={200: ScheduleSerializer(many=True)},
     )
     def get(self, request, *args, **kwargs):
         queryset = self.get_queryset()
-        serializer = self.get_serializer(queryset, many=True)
         message = S.SCHEDULE_LIST_SUCCESS if queryset else S.SCHEDULE_LIST_EMPTY
         return Response(
             {
                 "code": message["code"],
                 "message": message["message"],
-                "data": serializer.data,
-            }
+                "data": self.get_serializer(queryset, many=True).data,
+            },
+            status=status.HTTP_200_OK,
         )
 
     @swagger_auto_schema(
@@ -111,54 +98,57 @@ class ScheduleListCreateView(generics.ListCreateAPIView):
     )
     def post(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
-        if serializer.is_valid():
-            self.perform_create(serializer)
+        if not serializer.is_valid():
             return Response(
                 {
-                    "code": S.SCHEDULE_CREATE_SUCCESS["code"],
-                    "message": S.SCHEDULE_CREATE_SUCCESS["message"],
-                    "data": serializer.data,
-                }
+                    "code": S.SCHEDULE_CREATE_FAIL["code"],
+                    "message": S.SCHEDULE_CREATE_FAIL["message"],
+                    "data": serializer.errors,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
+
+        self.perform_create(serializer)
         return Response(
             {
-                "code": S.SCHEDULE_CREATE_FAIL["code"],
-                "message": S.SCHEDULE_CREATE_FAIL["message"],
-                "data": serializer.errors,
-            }
+                "code": S.SCHEDULE_CREATE_SUCCESS["code"],
+                "message": S.SCHEDULE_CREATE_SUCCESS["message"],
+                "data": serializer.data,
+            },
+            status=status.HTTP_201_CREATED,
         )
 
     def perform_create(self, serializer):
         idol_id = self.kwargs["idol_id"]
-        try:
-            idol = Idol.objects.get(id=idol_id)
-        except ObjectDoesNotExist:
-            # 존재하지 않는 아이돌 ID로 접근 시 예외 처리
+        idol = Idol.objects.filter(id=idol_id).first()
+
+        if not idol:
             raise PermissionDenied(S.SCHEDULE_IDOL_NOT_FOUND["message"])
 
-        # 아이돌 담당 매니저 여부 검증
+        # 요청 사용자가 해당 아이돌의 매니저인지 권한 확인
         if self.request.user not in idol.managers.all():
             raise PermissionDenied(S.SCHEDULE_PERMISSION_DENIED["message"])
 
         serializer.save(user=self.request.user, idol=idol)
 
 
-# 일정 상세 조회, 수정, 삭제 (아이돌 단위)
-class ScheduleRetrieveUpdateDeleteView(
-    generics.RetrieveAPIView, generics.DestroyAPIView, generics.UpdateAPIView
-):
+class ScheduleRetrieveUpdateDeleteView(generics.RetrieveUpdateDestroyAPIView):
     serializer_class = ScheduleSerializer
 
     def get_permissions(self):
-        # GET은 누구나 접근 가능, 나머지는 관리자 또는 소유자만
-        if self.request.method == "GET":
-            return [permissions.AllowAny()]  # 인증 없이 접근 허용
-        return [IsIdolManagerOrOwner()]  # PATCH, DELETE는 관리자나 소유자만 가능
+        return (
+            [permissions.AllowAny()]
+            if self.request.method == "GET"
+            else [IsIdolManagerOrOwner()]
+        )
 
     def get_queryset(self):
+        # swagger 문서 생성용 가짜 요청 처리 (문서화 시 필요)
         if getattr(self, "swagger_fake_view", False):
-            return Schedule.objects.none()  # Swagger용 빈 쿼리셋 반환
-        return Schedule.objects.filter(idol_id=self.kwargs["idol_id"])
+            return Schedule.objects.none()
+        return Schedule.objects.select_related("idol", "user").filter(
+            idol_id=self.kwargs["idol_id"]
+        )
 
     @swagger_auto_schema(
         operation_summary="아이돌 일정 상세 조회",
@@ -168,13 +158,13 @@ class ScheduleRetrieveUpdateDeleteView(
     def get(self, request, *args, **kwargs):
         try:
             instance = self.get_object()
-            serializer = self.get_serializer(instance)
             return Response(
                 {
                     "code": S.SCHEDULE_RETRIEVE_SUCCESS["code"],
                     "message": S.SCHEDULE_RETRIEVE_SUCCESS["message"],
-                    "data": {"schedule_view": serializer.data},
-                }
+                    "data": {"schedule_view": self.get_serializer(instance).data},
+                },
+                status=status.HTTP_200_OK,
             )
         except ObjectDoesNotExist:
             return Response(
@@ -182,7 +172,8 @@ class ScheduleRetrieveUpdateDeleteView(
                     "code": S.SCHEDULE_NOT_FOUND["code"],
                     "message": S.SCHEDULE_NOT_FOUND["message"],
                     "data": None,
-                }
+                },
+                status=status.HTTP_404_NOT_FOUND,
             )
 
     @swagger_auto_schema(
@@ -192,12 +183,9 @@ class ScheduleRetrieveUpdateDeleteView(
         responses={200: ScheduleSerializer},
     )
     def patch(self, request, *args, **kwargs):
-        partial = True
         try:
             instance = self.get_object()
-            serializer = self.get_serializer(
-                instance, data=request.data, partial=partial
-            )
+            serializer = self.get_serializer(instance, data=request.data, partial=True)
             if serializer.is_valid():
                 self.perform_update(serializer)
                 return Response(
@@ -205,14 +193,16 @@ class ScheduleRetrieveUpdateDeleteView(
                         "code": S.SCHEDULE_UPDATE_SUCCESS["code"],
                         "message": S.SCHEDULE_UPDATE_SUCCESS["message"],
                         "data": serializer.data,
-                    }
+                    },
+                    status=status.HTTP_200_OK,
                 )
             return Response(
                 {
                     "code": S.SCHEDULE_UPDATE_FAIL["code"],
                     "message": S.SCHEDULE_UPDATE_FAIL["message"],
                     "data": serializer.errors,
-                }
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
         except PermissionDenied:
             return Response(
@@ -220,7 +210,8 @@ class ScheduleRetrieveUpdateDeleteView(
                     "code": S.SCHEDULE_UPDATE_PERMISSION_DENIED["code"],
                     "message": S.SCHEDULE_UPDATE_PERMISSION_DENIED["message"],
                     "data": None,
-                }
+                },
+                status=status.HTTP_403_FORBIDDEN,
             )
 
     @swagger_auto_schema(
@@ -237,7 +228,8 @@ class ScheduleRetrieveUpdateDeleteView(
                     "code": S.SCHEDULE_DELETE_SUCCESS["code"],
                     "message": S.SCHEDULE_DELETE_SUCCESS["message"],
                     "data": {"schedule_id": instance.id},
-                }
+                },
+                status=status.HTTP_204_NO_CONTENT,
             )
         except PermissionDenied:
             return Response(
@@ -245,15 +237,18 @@ class ScheduleRetrieveUpdateDeleteView(
                     "code": S.SCHEDULE_DELETE_PERMISSION_DENIED["code"],
                     "message": S.SCHEDULE_DELETE_PERMISSION_DENIED["message"],
                     "data": None,
-                }
+                },
+                status=status.HTTP_403_FORBIDDEN,
             )
 
-    @swagger_auto_schema(auto_schema=None)  # Swagger 문서에서 PUT 제거
+    @swagger_auto_schema(auto_schema=None)
     def put(self, request, *args, **kwargs):
-        pass  # PUT 비활성화
-
-    def perform_update(self, serializer):
-        serializer.save()
-
-    def perform_destroy(self, instance):
-        instance.delete()
+        # PUT은 허용하지 않음 (명시적으로 405 반환)
+        return Response(
+            {
+                "code": "METHOD_NOT_ALLOWED",
+                "message": "PUT 메서드는 지원되지 않습니다.",
+                "data": None,
+            },
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
